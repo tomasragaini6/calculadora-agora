@@ -139,42 +139,6 @@ def calcular_drawdown(retornos_diarios):
     return dd, dd.min()
 
 
-def cagr_real_cartera(retornos_diarios_cartera):
-    """CAGR real de una cartera: compone la serie de retornos diarios
-    (equity curve) y anualiza sobre los días calendario transcurridos.
-    A diferencia de `ret` en `performance()` (que es la media aritmética
-    de retornos diarios anualizada — el input que usa el optimizador de
-    Markowitz), esto es lo que la cartera efectivamente hubiera rendido.
-    Con activos volátiles ambas métricas pueden diferir mucho (volatility
-    drag): CAGR ≈ media_aritmética − volatilidad²/2."""
-    equity = (1 + retornos_diarios_cartera).cumprod()
-    dias = (equity.index[-1] - equity.index[0]).days
-    if dias <= 0:
-        return np.nan
-    return equity.iloc[-1] ** (365.25 / dias) - 1
-
-
-def retornos_anuales_cartera(retornos_diarios_cartera):
-    """Retorno compuesto por año calendario de una cartera. Devuelve una
-    Series indexada por año, más un flag de qué años son parciales
-    (menos de ~200 ruedas) para no leerlos como un año completo."""
-    retorno_anual = (1 + retornos_diarios_cartera).groupby(
-        retornos_diarios_cartera.index.year).prod() - 1
-    ruedas = retornos_diarios_cartera.groupby(retornos_diarios_cartera.index.year).size()
-    return retorno_anual, ruedas < 200
-
-
-def tabla_retornos_anuales(carteras_retornos_diarios: dict):
-    """carteras_retornos_diarios: {"Sharpe Óptimo": serie_retornos_diarios, ...}
-    Devuelve (tabla, tabla_parciales) con años en filas y carteras en columnas."""
-    columnas, parciales = {}, {}
-    for nombre, serie in carteras_retornos_diarios.items():
-        ret_anual, parcial = retornos_anuales_cartera(serie)
-        columnas[nombre] = ret_anual
-        parciales[nombre] = parcial
-    return pd.DataFrame(columnas), pd.DataFrame(parciales)
-
-
 def cartera_equally_weighted(cov):
     """Cartera 'estándar' de referencia: igual ponderación (1/N) entre
     todos los activos, sin ninguna optimización. Sirve como benchmark
@@ -310,23 +274,6 @@ def main():
             dd_sharpe, max_dd_sharpe = calcular_drawdown(returns @ w_sharpe)
             dd_eq, max_dd_eq = calcular_drawdown(returns @ w_eq)
 
-            # --- Retornos diarios de cada cartera y CAGR real (equity curve),
-            # para complementar el "Retorno" del optimizador (media aritmética)
-            # con lo que la cartera efectivamente hubiera rendido.
-            ret_diarios_sharpe = returns @ w_sharpe
-            ret_diarios_minvar = returns @ w_minvar
-            ret_diarios_eq = returns @ w_eq
-            carteras_diarias = {
-                "Sharpe Óptimo": ret_diarios_sharpe,
-                "Mínima Volatilidad": ret_diarios_minvar,
-                "Igual Ponderación": ret_diarios_eq,
-            }
-            if target is not None and ok_target:
-                carteras_diarias["Retorno Objetivo"] = returns @ w_target
-
-            cagr_real = {nombre: cagr_real_cartera(serie) for nombre, serie in carteras_diarias.items()}
-            tabla_anual, tabla_anual_parcial = tabla_retornos_anuales(carteras_diarias)
-
         st.session_state["resultado"] = dict(
             tickers=tickers, descartados=descartados, prices=prices, returns=returns,
             mu=mu, cov=cov, corr=corr, cagr=cagr, rf=rf, min_weight=min_weight, target=target,
@@ -337,7 +284,6 @@ def main():
             cum_activos=cum_activos, cum_minvar=cum_minvar, cum_sharpe=cum_sharpe, cum_eq=cum_eq,
             dd_minvar=dd_minvar, dd_sharpe=dd_sharpe, dd_eq=dd_eq,
             max_dd_minvar=max_dd_minvar, max_dd_sharpe=max_dd_sharpe, max_dd_eq=max_dd_eq,
-            cagr_real=cagr_real, tabla_anual=tabla_anual, tabla_anual_parcial=tabla_anual_parcial,
         )
 
     r = st.session_state["resultado"]
@@ -374,39 +320,6 @@ def main():
     st.caption("La cartera Igual Ponderación (1/N) es la referencia \"estándar\" sin optimizar — "
               "sirve para ver cuánto suma realmente el modelo de Markowitz por sobre repartir "
               "el capital en partes iguales.")
-
-    # --- CAGR real de cartera + retorno año a año ---
-    st.markdown("##### CAGR real de la cartera (equity curve)")
-    st.caption("El \"Retorno\" de la tabla de arriba es la media aritmética anualizada que usa "
-              "el optimizador como objetivo (el input estándar del modelo de Markowitz). El CAGR "
-              "de acá abajo es distinto: compone la serie de retornos diarios real de cada cartera, "
-              "así que es lo que esa cartera efectivamente hubiera rendido en el período. Con "
-              "activos volátiles, ambos números pueden diferir bastante (volatility drag).")
-
-    cols_cagr = st.columns(len(r["cagr_real"]))
-    for col, (nombre, valor) in zip(cols_cagr, r["cagr_real"].items()):
-        col.metric(nombre, f"{valor:.2%}")
-
-    st.markdown("##### Retorno año a año")
-    tabla_anual_pct = r["tabla_anual"].copy()
-    tabla_anual_pct.index.name = "Año"
-
-    def _marcar_parcial(col):
-        nombre = col.name
-        flags = r["tabla_anual_parcial"][nombre]
-        return ["font-style: italic; color: #9aa5b1;" if flags.get(idx, False) else ""
-                for idx in col.index]
-
-    st.dataframe(
-        tabla_anual_pct.style
-            .format("{:+.2%}", na_rep="—")
-            .background_gradient(cmap="RdYlGn", axis=None, vmin=-0.5, vmax=0.5)
-            .apply(_marcar_parcial, axis=0),
-        use_container_width=True,
-    )
-    st.caption("Los años en cursiva/gris tienen menos de ~200 ruedas operadas (primer y último "
-              "año del período descargado) — son años parciales, no comparables 1 a 1 contra un "
-              "año calendario completo.")
 
     st.divider()
 
