@@ -23,6 +23,7 @@ import plotly.express as px
 import streamlit as st
 import yfinance as yf
 from scipy.optimize import minimize
+from matplotlib.colors import LinearSegmentedColormap
 
 # %% -------------------- CONFIGURACIÓN DE PÁGINA --------------------
 st.set_page_config(page_title="Optimizador de Carteras · Ágora", layout="wide", page_icon="📈",
@@ -49,6 +50,25 @@ PLOTLY_LAYOUT_BASE = dict(
     font=dict(color=TEXTO, family="Lato, sans-serif"),
     margin=dict(l=10, r=10, t=30, b=10),
 )
+
+# --- Paleta de color para tablas (reemplaza el RdYlGn/YlOrBr de matplotlib,
+# que pasan por un amarillo muy claro y quedan poco legibles sobre fondo
+# oscuro). Va de rojo apagado a naranja quemado, pasa por un gris-navy
+# neutro cerca del centro de la escala (se funde con el panel en vez de
+# "gritar"), y termina en verde. Todos los tonos son medios/oscuros para
+# que el texto claro se lea bien en cualquier punto de la escala.
+CMAP_AGORA = LinearSegmentedColormap.from_list("agora_diverging", [
+    (0.00, "#8B3A3A"),   # rojo apagado — extremo bajo / desfavorable
+    (0.25, "#B8703A"),   # naranja quemado
+    (0.50, "#3A4358"),   # gris-navy neutro — centro de la escala
+    (0.75, "#4F8B5B"),   # verde medio
+    (1.00, "#2F6B4F"),   # verde Ágora — extremo alto / favorable
+])
+CMAP_AGORA_INV = CMAP_AGORA.reversed()  # para métricas donde "menos" es mejor (volatilidad, drawdown)
+CMAP_AGORA_SECUENCIAL = LinearSegmentedColormap.from_list("agora_secuencial", [
+    (0.00, "#1C2E5E"),   # navy claro — valor bajo, se funde con el fondo
+    (1.00, "#C9A84C"),   # dorado Ágora — valor alto
+])
 
 
 def aplicar_estilos():
@@ -129,7 +149,19 @@ def aplicar_estilos():
 # =====================================================================
 def descargar_precios(tickers, years):
     """Descarga precios de cierre ajustado desde Yahoo! Finance para la
-    ventana de `years` años. Devuelve (precios, tickers_descartados)."""
+    ventana de `years` años. Devuelve (precios, tickers_sin_datos,
+    tickers_historia_corta).
+
+    Separa dos motivos de exclusión distintos:
+    - tickers_sin_datos: no se pudieron descargar (símbolo mal escrito,
+      deslistado, etc.)
+    - tickers_historia_corta: tienen datos, pero empezaron a cotizar
+      bastante después del inicio de la ventana pedida (ej. una IPO
+      reciente). Si se los dejara adentro, el .dropna() final truncaría
+      la historia de TODOS los demás activos a la fecha de esa IPO —
+      por eso se excluyen del cálculo conjunto y se devuelven aparte,
+      para que el resto conserve toda la ventana de `years` años.
+    """
     start = (pd.Timestamp.today() - pd.DateOffset(years=years)).strftime("%Y-%m-%d")
     data = yf.download(tickers, start=start, auto_adjust=True, progress=False)["Close"]
 
@@ -137,10 +169,24 @@ def descargar_precios(tickers, years):
         data = data.to_frame(tickers[0] if len(tickers) == 1 else "ACTIVO")
 
     tickers_ok = [t for t in tickers if t in data.columns and data[t].notna().sum() > 30]
-    tickers_descartados = [t for t in tickers if t not in tickers_ok]
+    tickers_sin_datos = [t for t in tickers if t not in tickers_ok]
 
-    data = data[tickers_ok].dropna(how="all").ffill().dropna()
-    return data, tickers_descartados
+    # Margen de ~90 días: si la primera cotización disponible aparece más
+    # tarde que eso respecto del inicio de la ventana pedida, el ticker
+    # no cubre los `years` años completos.
+    limite = pd.Timestamp(start) + pd.Timedelta(days=90)
+    tickers_historia_corta = []
+    tickers_completos = []
+    for t in tickers_ok:
+        primera_fecha = data[t].first_valid_index()
+        if primera_fecha is not None and primera_fecha > limite:
+            tickers_historia_corta.append((t, primera_fecha.strftime("%d/%m/%Y")))
+        else:
+            tickers_completos.append(t)
+
+    tickers_usados = tickers_completos if tickers_completos else tickers_ok
+    data = data[tickers_usados].dropna(how="all").ffill().dropna()
+    return data, tickers_sin_datos, tickers_historia_corta
 
 
 def calcular_cagr_por_activo(prices, trading_days=252):
@@ -392,7 +438,7 @@ def main():
                 st.warning("El retorno objetivo no es un número válido, se ignora.")
 
         with st.spinner("Descargando precios y optimizando..."):
-            prices, descartados = descargar_precios(tickers, years)
+            prices, descartados, historia_corta = descargar_precios(tickers, years)
 
             if prices.shape[1] < 2:
                 st.error("No se pudo descargar suficiente información para al menos 2 tickers. "
@@ -445,7 +491,8 @@ def main():
             tabla_anual, tabla_anual_parcial = tabla_retornos_anuales(carteras_diarias)
 
         st.session_state["resultado"] = dict(
-            tickers=tickers, descartados=descartados, prices=prices, returns=returns,
+            tickers=tickers, descartados=descartados, historia_corta=historia_corta,
+            prices=prices, returns=returns,
             mu=mu, cov=cov, corr=corr, cagr=cagr, rf=rf, min_weight=min_weight, target=target,
             years=years,
             w_minvar=w_minvar, w_sharpe=w_sharpe, w_eq=w_eq, w_target=w_target, ok_target=ok_target,
@@ -459,11 +506,18 @@ def main():
         )
 
     r = st.session_state["resultado"]
-    n_activos = len(r["tickers"]) - len(r["descartados"])
+    n_activos = r["prices"].shape[1]
 
     if r["descartados"]:
         st.warning(f"No se pudieron descargar (o tienen muy poca historia) estos tickers, "
                    f"fueron excluidos: {', '.join(r['descartados'])}")
+
+    if r.get("historia_corta"):
+        detalle = ", ".join(f"**{t}** (cotiza desde {fecha})" for t, fecha in r["historia_corta"])
+        st.warning(f"Excluidos del cálculo conjunto por no cubrir los {r['years']} años de historia "
+                   f"pedidos: {detalle}. Si los dejara adentro, la fecha de su primera cotización "
+                   f"pasaría a limitar la ventana de *todos* los demás activos. Para incluirlos, "
+                   f"bajá 'Años de historia' a un período que sí cubran, o analizalos por separado.")
 
     # --- Tarjetas rápidas ---
     c1, c2, c3, c4 = st.columns(4)
@@ -490,8 +544,9 @@ def main():
     st.dataframe(
         tabla_comparacion.style.format({"Retorno": "{:.2%}", "Volatilidad": "{:.2%}",
                                         "Sharpe": "{:.2f}", "Máx. Drawdown": "{:.2%}"})
-        .background_gradient(cmap="RdYlGn", subset=["Sharpe"])
-        .background_gradient(cmap="RdYlGn_r", subset=["Volatilidad", "Máx. Drawdown"]),
+        .background_gradient(cmap=CMAP_AGORA, subset=["Sharpe"])
+        .background_gradient(cmap=CMAP_AGORA_INV, subset=["Volatilidad", "Máx. Drawdown"])
+        .set_properties(**{"color": TEXTO}),
         use_container_width=True,
     )
     st.markdown('<p class="agora-caption">La cartera Igual Ponderación (1/N) es la referencia '
@@ -521,7 +576,8 @@ def main():
             st.subheader("CAGR por activo")
             st.dataframe(
                 tabla_completa.style.format({"CAGR anual": "{:.2%}"})
-                .background_gradient(cmap="RdYlGn", subset=["CAGR anual"]),
+                .background_gradient(cmap=CMAP_AGORA, subset=["CAGR anual"])
+                .set_properties(**{"color": TEXTO}),
                 use_container_width=True, height=380,
             )
         with col_heatmap:
@@ -565,13 +621,14 @@ def main():
 
         def _marcar_parcial(col):
             flags = r["tabla_anual_parcial"][col.name]
-            return ["font-style: italic; color: #8891A5;" if flags.get(idx, False) else ""
+            return ["font-style: italic; color: #C9CED8;" if flags.get(idx, False) else ""
                     for idx in col.index]
 
         st.dataframe(
             tabla_anual_pct.style
                 .format("{:+.2%}", na_rep="—")
-                .background_gradient(cmap="RdYlGn", axis=None, vmin=-0.5, vmax=0.5)
+                .background_gradient(cmap=CMAP_AGORA, axis=None, vmin=-0.5, vmax=0.5)
+                .set_properties(**{"color": TEXTO, "font-weight": "600"})
                 .apply(_marcar_parcial, axis=0),
             use_container_width=True,
         )
@@ -671,7 +728,9 @@ def main():
                     st.warning("El retorno objetivo pedido no es alcanzable con estos activos "
                               "(está fuera del rango que permite la frontera eficiente).")
             st.dataframe(
-                tabla_pesos.style.format("{:.2%}").background_gradient(cmap="YlOrBr", axis=0),
+                tabla_pesos.style.format("{:.2%}")
+                .background_gradient(cmap=CMAP_AGORA_SECUENCIAL, axis=0)
+                .set_properties(**{"color": TEXTO}),
                 use_container_width=True, height=460,
             )
 
@@ -685,5 +744,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
